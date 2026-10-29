@@ -59,6 +59,8 @@ console.log(`IAs (por ordem): ${providers.map((p) => `${p.name} [${p.model}]`).j
 
 // Serviço em pausa até esta hora (depois de um erro de limite).
 const cooldownUntil = new Map();
+// Serviços cuja pausa atual é por limite diário.
+const dailyHit = new Set();
 
 export class RefusalError extends Error {}
 
@@ -152,9 +154,61 @@ async function callOpenAI(p, { system, messages, tools, noTools }) {
   return { text, message: { role: "assistant", content: text || null, ...(tool_calls.length && { tool_calls }) } };
 }
 
-function cooldownMs(err) {
-  const retryAfter = Number(err?.headers?.get?.("retry-after"));
-  return Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 60_000;
+// ---------- Limites: por minuto vs. por dia ----------
+
+const HOUR = 3_600_000;
+
+// Milissegundos até à próxima meia-noite num fuso horário (ex.: "America/Los_Angeles", "UTC").
+function msUntilMidnight(timeZone) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", { timeZone, hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      .formatToParts(new Date())
+      .map((p) => [p.type, Number(p.value)]),
+  );
+  const elapsed = ((parts.hour % 24) * 3600 + parts.minute * 60 + parts.second) * 1000;
+  return 24 * HOUR - elapsed + 60_000; // +1 min de margem
+}
+
+// Hora a que o limite diário renova em cada serviço (quando se sabe).
+const DAILY_RESET = {
+  gemini: () => msUntilMidnight("America/Los_Angeles"),
+  openrouter: () => msUntilMidnight("UTC"),
+};
+
+// Converte durações do tipo "2m59.5s", "1h3m", "250ms" (cabeçalhos do Groq) em ms.
+function parseDuration(str) {
+  if (!str) return null;
+  if (/^\d+(\.\d+)?$/.test(str)) return Number(str) * 1000;
+  let ms = 0;
+  for (const [, n, unit] of str.matchAll(/(\d+(?:\.\d+)?)(ms|h|m|s)/g)) {
+    ms += Number(n) * { ms: 1, s: 1000, m: 60_000, h: HOUR }[unit];
+  }
+  return ms || null;
+}
+
+function isDailyLimit(err) {
+  const text = `${err?.message ?? ""} ${JSON.stringify(err?.error ?? "")}`;
+  return /per[ _-]?day|perday|daily|\bRPD\b|\bTPD\b|free-models-per-day/i.test(text);
+}
+
+// Quanto tempo pôr um serviço em pausa depois de um erro 429.
+function cooldownMs(name, err) {
+  const header = (h) => err?.headers?.get?.(h);
+  if (isDailyLimit(err)) {
+    const reset = DAILY_RESET[name]?.() ?? parseDuration(header("x-ratelimit-reset-requests")) ?? parseDuration(header("x-ratelimit-reset-tokens"));
+    return { ms: Math.max(reset ?? HOUR, 60_000), daily: true }; // hora desconhecida: tenta de hora a hora
+  }
+  const retryAfter = parseDuration(header("retry-after"));
+  return { ms: retryAfter && retryAfter > 0 ? retryAfter : 60_000, daily: false };
+}
+
+// Estado de cada IA, para o comando "ias".
+export function status() {
+  const now = Date.now();
+  return providers.map((p) => {
+    const until = cooldownUntil.get(p.name);
+    return { name: p.name, model: p.model, pausedUntil: until > now ? until : null, daily: dailyHit.has(p.name) && until > now };
+  });
 }
 
 // Uma volta de conversa: tenta cada serviço por ordem até um responder.
@@ -169,13 +223,19 @@ export async function chat({ system, messages, tools, noTools = false, effort = 
     try {
       const out = p.name === "claude" ? await callClaude(p, { system, messages, tools, noTools, effort }) : await callOpenAI(p, { system, messages, tools, noTools });
       cooldownUntil.delete(p.name);
+      dailyHit.delete(p.name);
       const toolCalls = (out.message.tool_calls || []).map((tc) => ({ id: tc.id, name: tc.function.name, input: parseArgs(tc.function.arguments) }));
       return { ...out, toolCalls, provider: `${p.name} (${p.model})` };
     } catch (err) {
       if (err instanceof RefusalError) errors.push(`${p.name}: recusou`);
       else {
         const status = err?.status;
-        if (status === 429) cooldownUntil.set(p.name, Date.now() + cooldownMs(err));
+        if (status === 429) {
+          const { ms, daily } = cooldownMs(p.name, err);
+          cooldownUntil.set(p.name, Date.now() + ms);
+          daily ? dailyHit.add(p.name) : dailyHit.delete(p.name);
+          if (daily) console.warn(`[IA] ${p.name}: limite DIÁRIO atingido, em pausa até ${new Date(Date.now() + ms).toLocaleString("pt-PT")}`);
+        }
         errors.push(`${p.name}: ${status ? `HTTP ${status}` : err.message}`);
         console.warn(`[IA] ${p.name} falhou (${status ?? err.message}); a tentar o próximo…`);
       }

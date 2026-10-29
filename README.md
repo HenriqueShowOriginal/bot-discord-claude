@@ -88,7 +88,11 @@ AI_PROVIDERS=claude                        # só Claude
 | Ollama | grátis, corre no teu PC | https://ollama.com |
 | Claude | pago (Haiku 5.5 é muito barato) | https://console.anthropic.com |
 
-No fim de cada resposta aparece, em letra pequena, que IA respondeu. Se um serviço der "limite atingido", fica em pausa durante uns segundos ou minutos e as outras assumem.
+No fim de cada resposta aparece, em letra pequena, que IA respondeu. Quando um serviço dá "limite atingido", o bot percebe que tipo de limite é:
+- **por minuto:** pausa esse serviço durante uns segundos;
+- **diário:** pausa-o até à hora em que o limite renova. No Gemini, isso é à meia-noite do Pacífico, cerca das 8h em Portugal. No OpenRouter, é à meia-noite UTC. Nos serviços que não publicam a hora, volta a tentar de hora a hora.
+
+Enquanto um serviço está em pausa, as outras IAs assumem. Escreve `ias` na #claude-chat para ver o estado de cada uma: 🟢 disponível, 🟡 limite por minuto ou 🔴 limite diário, e quando volta.
 
 ⚠️ Os planos grátis mudam muitas vezes. Confirma os limites e os nomes dos modelos no site de cada serviço; os nomes podem ser trocados no `.env` (`GEMINI_MODEL`, etc.). Alguns planos grátis (ex.: Gemini fora da UE, Mistral) podem usar os dados para treino.
 

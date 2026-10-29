@@ -12,7 +12,7 @@ import { apiTools, toolMap, validateInput } from "./tools.js";
 import { COLORS, log, registerLogEvents } from "./logs.js";
 import { ensureChannels, isChatChannel, isLogsChannel } from "./setup.js";
 import { buildSnapshot, SCAN_PROMPT } from "./scan.js";
-import { chat } from "./ai.js";
+import { chat, status } from "./ai.js";
 
 const MAX_HISTORY = 60; // mensagens por canal antes de recomeçar a conversa
 const MAX_STEPS = 25; // máximo de rondas de ferramentas por pedido
@@ -206,7 +206,16 @@ discord.on("messageCreate", async (message) => {
     histories.delete(chat.id);
     return analyzeServer(message.guild, chat);
   }
-  if (!prompt) return message.reply("Diz-me o que queres fazer no servidor. (`scan` analisa o servidor, `reset` apaga a memória)");
+  if (["ias", "ia", "status"].includes(prompt.toLowerCase())) {
+    const lines = status().map((s, i) => {
+      const state = !s.pausedUntil
+        ? "🟢 disponível"
+        : `${s.daily ? "🔴 limite diário" : "🟡 limite por minuto"} — volta <t:${Math.floor(s.pausedUntil / 1000)}:R>`;
+      return `${i + 1}. **${s.name}** \`${s.model}\` — ${state}`;
+    });
+    return message.reply(`**IAs por ordem de uso:**\n${lines.join("\n")}`);
+  }
+  if (!prompt) return message.reply("Diz-me o que queres fazer no servidor. (`scan` analisa o servidor, `ias` mostra o estado das IAs, `reset` apaga a memória)");
   if (prompt.toLowerCase() === "reset") {
     histories.delete(message.channelId);
     return message.reply("Memória da conversa apagada.");
