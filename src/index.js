@@ -1,5 +1,4 @@
 import "dotenv/config";
-import Anthropic from "@anthropic-ai/sdk";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -13,15 +12,14 @@ import { apiTools, toolMap, validateInput } from "./tools.js";
 import { COLORS, log, registerLogEvents } from "./logs.js";
 import { ensureChannels, isChatChannel, isLogsChannel } from "./setup.js";
 import { buildSnapshot, SCAN_PROMPT } from "./scan.js";
+import { chat } from "./ai.js";
 
-const MODEL = process.env.CLAUDE_MODEL || "claude-opus-5-5";
 const MAX_HISTORY = 60; // mensagens por canal antes de recomeçar a conversa
 const MAX_STEPS = 25; // máximo de rondas de ferramentas por pedido
 
 // Quem pode dar ordens ao bot: IDs em ALLOWED_USERS, o dono do servidor, ou quem tem Administrador.
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || "").split(",").map((s) => s.trim()).filter(Boolean);
 
-const anthropic = new Anthropic(); // lê ANTHROPIC_API_KEY do ambiente
 const discord = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -34,7 +32,7 @@ const discord = new Client({
 });
 registerLogEvents(discord);
 
-// Histórico de conversa por canal. Guardamos sempre o `content` completo das respostas.
+// Histórico de conversa por canal, no formato neutro de ai.js (serve para qualquer IA).
 const histories = new Map();
 
 function systemPrompt(guild, author) {
@@ -91,7 +89,7 @@ async function runTool(block, ctx) {
     const result = await tool.run(ctx, block.input);
     if (!tool.readOnly && block.name !== "enviar_aviso") {
       log(ctx.guild, {
-        title: `🤖 Claude: ${block.name}`,
+        title: `🤖 Bot: ${block.name}`,
         description: `Pedido por <@${ctx.message.author.id}>\n\`\`\`json\n${JSON.stringify(block.input, null, 1).slice(0, 900)}\n\`\`\``,
         color: tool.destructive ? COLORS.perigo : COLORS.claude,
       });
@@ -99,7 +97,7 @@ async function runTool(block, ctx) {
     return { content: typeof result === "string" ? result : JSON.stringify(result) };
   } catch (err) {
     if (!tool.readOnly) {
-      log(ctx.guild, { title: `❌ Claude falhou: ${block.name}`, description: err.message, color: COLORS.perigo });
+      log(ctx.guild, { title: `❌ Bot falhou: ${block.name}`, description: err.message, color: COLORS.perigo });
     }
     return { content: `Erro: ${err.message}`, is_error: true };
   }
@@ -125,44 +123,29 @@ async function sendLong(message, text) {
   }
 }
 
-const textOf = (response) =>
-  response.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
+// Mostra discretamente que IA respondeu (útil quando há várias configuradas).
+const signed = (out) => `${out.text || "(sem resposta)"}\n-# 🤖 ${out.provider}`;
 
 // Faz o scan do servidor e publica a análise na #claude-chat.
 // A análise fica no histórico da sala, para o dono poder responder às perguntas a seguir.
-async function analyzeServer(guild, chat) {
+async function analyzeServer(guild, room) {
   const owner = await guild.fetchOwner();
-  await chat.send(`🔎 <@${owner.id}>, estou a analisar o servidor… dá-me um minuto.`);
-  const typing = setInterval(() => chat.sendTyping().catch(() => {}), 8000);
+  await room.send(`🔎 <@${owner.id}>, estou a analisar o servidor… dá-me um minuto.`);
+  const typing = setInterval(() => room.sendTyping().catch(() => {}), 8000);
   try {
     const snapshot = await buildSnapshot(guild);
     const history = [
       { role: "user", content: `${SCAN_PROMPT}\n\n\`\`\`json\n${JSON.stringify(snapshot).slice(0, 80_000)}\n\`\`\`` },
     ];
-    const response = await anthropic.beta.messages.create({
-      model: MODEL,
-      max_tokens: 16000,
-      output_config: { effort: "high" },
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-      system: systemPrompt(guild, owner.user),
-      tools: apiTools,
-      tool_choice: { type: "none" }, // nesta fase só analisa, não mexe em nada
-      messages: history,
-    });
-    if (response.stop_reason === "refusal") return chat.send("Não consegui concluir a análise do servidor.");
-
-    history.push({ role: "assistant", content: response.content });
-    histories.set(chat.id, history);
-    for (const part of chunk(textOf(response))) await chat.send(part);
-    await log(guild, { title: "🔎 Scan do servidor concluído", description: `Análise publicada em ${chat}.`, color: COLORS.claude });
+    // noTools: nesta fase só analisa, não mexe em nada.
+    const out = await chat({ system: systemPrompt(guild, owner.user), messages: history, tools: apiTools, noTools: true, effort: "high" });
+    history.push(out.message);
+    histories.set(room.id, history);
+    for (const part of chunk(signed(out))) await room.send(part);
+    await log(guild, { title: "🔎 Scan do servidor concluído", description: `Análise publicada em ${room} (via ${out.provider}).`, color: COLORS.claude });
   } catch (err) {
-    console.error(`Scan falhou em ${guild.name}:`, err);
-    await chat.send("Não consegui fazer o scan agora. Escreve `scan` para tentar outra vez.");
+    console.error(`Scan falhou em ${guild.name}:`, err.message);
+    await room.send("Não consegui fazer o scan agora. Escreve `scan` para tentar outra vez.");
   } finally {
     clearInterval(typing);
   }
@@ -181,52 +164,27 @@ async function handle(message, prompt) {
 
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
-      const response = await anthropic.beta.messages.create({
-        model: MODEL,
-        max_tokens: 16000,
-        output_config: { effort: "medium" },
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
-        system: systemPrompt(guild, message.author),
-        tools: apiTools,
-        messages: history,
-      });
-
-      if (response.stop_reason === "refusal") {
-        histories.delete(message.channelId); // recomeça a conversa para não ficar bloqueada
-        return message.reply("Não posso ajudar com esse pedido.");
-      }
-
-      history.push({ role: "assistant", content: response.content });
-
-      if (response.stop_reason === "pause_turn") continue;
-
-      const toolUses = response.content.filter((b) => b.type === "tool_use");
-      if (response.stop_reason !== "tool_use" || toolUses.length === 0) {
-        return sendLong(message, textOf(response));
-      }
+      // Cada passo pode ser respondido por uma IA diferente se a anterior atingir o limite.
+      const out = await chat({ system: systemPrompt(guild, message.author), messages: history, tools: apiTools });
+      history.push(out.message);
+      if (!out.toolCalls.length) return sendLong(message, signed(out));
 
       // Destrutivas uma de cada vez (confirmação); as restantes podem correr em paralelo.
       const results = [];
-      for (const block of toolUses) {
-        const tool = toolMap.get(block.name);
-        results.push(tool?.destructive ? await runTool(block, ctx) : runTool(block, ctx));
+      for (const call of out.toolCalls) {
+        const tool = toolMap.get(call.name);
+        results.push(tool?.destructive ? await runTool(call, ctx) : runTool(call, ctx));
       }
       const settled = await Promise.all(results);
-      history.push({
-        role: "user",
-        content: toolUses.map((block, i) => ({ type: "tool_result", tool_use_id: block.id, ...settled[i] })),
-      });
+      out.toolCalls.forEach((call, i) => history.push({ role: "tool", tool_call_id: call.id, ...settled[i] }));
     }
     history.push({ role: "user", content: "(limite de passos atingido)" });
     return message.reply("Parei: o pedido precisava de demasiados passos. Diz-me como continuar.");
   } catch (err) {
-    histories.delete(message.channelId);
-    if (err instanceof Anthropic.RateLimitError) return message.reply("Estou com limite de pedidos, tenta daqui a pouco.");
-    if (err instanceof Anthropic.AuthenticationError) return message.reply("A chave da API do Claude é inválida.");
-    if (err instanceof Anthropic.APIError) return message.reply(`Erro da API do Claude (${err.status}).`);
-    console.error(err);
-    return message.reply("Ocorreu um erro inesperado.");
+    histories.delete(message.channelId); // recomeça a conversa para não ficar bloqueada
+    console.error(err.message);
+    if (err.allRefused) return message.reply("Não posso ajudar com esse pedido.");
+    return message.reply("Nenhuma IA conseguiu responder agora (limites atingidos ou erro). Tenta daqui a pouco.");
   } finally {
     clearInterval(typing);
   }
