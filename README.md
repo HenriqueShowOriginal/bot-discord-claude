@@ -41,7 +41,7 @@ Também podes mencionar o bot em qualquer outro canal, por exemplo:
 
 > @Bot apaga as últimas 50 mensagens do #geral
 
-A IA consulta o servidor, escolhe as ferramentas certas e executa. Antes de **apagar canais ou cargos, expulsar, banir ou limpar mensagens**, aparece um botão para confirmares.
+A IA consulta o servidor, escolhe as ferramentas certas e executa. Antes de **apagar canais ou cargos, expulsar, banir, limpar mensagens ou dar permissões de moderação/administração** (a um cargo, a um membro ou num canal), aparece um botão para confirmares.
 
 ## O que ele consegue fazer
 - **Servidor:** ver informações, mudar o nome e a descrição
@@ -97,7 +97,13 @@ Enquanto um serviço está em pausa, as outras IAs assumem. Escreve `ias` na #cl
 ⚠️ Os planos grátis mudam muitas vezes. Confirma os limites e os nomes dos modelos no site de cada serviço; os nomes podem ser trocados no `.env` (`GEMINI_MODEL`, etc.). Alguns planos grátis (ex.: Gemini fora da UE, Mistral) podem usar os dados para treino.
 
 ## Adicionar novas ferramentas
-Em `src/tools.js`, acrescenta um objeto com `name`, `description`, `input_schema` e `run`. Se a ação for perigosa, junta `destructive: true` e `describe`. A IA passa a usá-la automaticamente.
+Em `src/tools.js`, acrescenta um objeto com `name`, `description`, `input_schema` e `run`. Se a ação for perigosa, junta `destructive: true` e `describe`; se só for perigosa em certos casos, usa `needsConfirm(ctx, input)` em vez de `destructive`. Números aceitam `minimum`/`maximum` no schema e são validados antes de a ferramenta correr. A IA passa a usá-la automaticamente.
+
+## Testes
+```bash
+npm test
+```
+Correm sem ligação ao Discord nem chaves de IA.
 
 ## Notas
 - Cada pedido envia ~5 a 8 mil tokens (instruções + ferramentas) e pode precisar de várias chamadas. Serviços com limites de tokens por minuto baixos (ex.: Groq grátis) esgotam-se mais depressa, e é para isso que serve a reserva automática.

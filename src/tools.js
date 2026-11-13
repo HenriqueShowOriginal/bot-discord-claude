@@ -4,6 +4,7 @@ import { isOurChannel } from "./setup.js";
 
 // Ferramentas que o Claude pode usar no servidor.
 // `destructive: true` => o bot pede confirmação com botões antes de executar.
+// `needsConfirm(ctx, input)` => pede confirmação só quando devolve true (ex.: permissões poderosas).
 
 const CHANNEL_TYPES = {
   texto: ChannelType.GuildText,
@@ -20,7 +21,8 @@ const obj = (properties, required = []) => ({
   required,
 });
 const str = (description) => ({ type: "string", description });
-const num = (description) => ({ type: "number", description });
+const num = (description, limits = {}) => ({ type: "number", description, ...limits });
+const int = (description, limits = {}) => ({ type: "integer", description, ...limits });
 const bool = (description) => ({ type: "boolean", description });
 
 async function getChannel(guild, id) {
@@ -42,14 +44,39 @@ async function getMember(guild, id) {
   if (!m) throw new Error(`Membro ${id} não encontrado`);
   return m;
 }
-function parseColor(c) {
+export function parseColor(c) {
   if (!c) return undefined;
-  return parseInt(String(c).replace("#", ""), 16);
+  const hex = String(c).trim().replace(/^#/, "");
+  if (!/^[0-9a-fA-F]{6}$/.test(hex)) throw new Error(`Cor inválida: "${c}". Usa hex com 6 dígitos, ex.: #ff0000`);
+  return parseInt(hex, 16);
 }
-function parsePerms(list) {
+// Nomes desconhecidos dão erro: ignorá-los faria `editar_cargo` substituir as permissões por uma lista vazia.
+function checkPerms(list) {
+  const unknown = list.filter((p) => PermissionsBitField.Flags[p] === undefined);
+  if (unknown.length) {
+    throw new Error(`Permissões desconhecidas: ${unknown.join(", ")}. Usa os nomes exatos do discord.js (ex.: ManageMessages, BanMembers).`);
+  }
+}
+export function parsePerms(list) {
   if (!list) return undefined;
-  return new PermissionsBitField(list.map((p) => PermissionsBitField.Flags[p]).filter(Boolean));
+  checkPerms(list);
+  return new PermissionsBitField(list.map((p) => PermissionsBitField.Flags[p]));
 }
+
+// Permissões que dão poder sobre o servidor: atribuí-las pede confirmação com botões.
+const DANGEROUS_PERMS = [
+  "Administrator",
+  "ManageGuild",
+  "ManageRoles",
+  "ManageChannels",
+  "ManageWebhooks",
+  "BanMembers",
+  "KickMembers",
+  "ModerateMembers",
+  "ManageMessages",
+  "MentionEveryone",
+];
+const dangerousIn = (list = []) => list.filter((p) => DANGEROUS_PERMS.includes(p));
 
 export const tools = [
   {
@@ -129,8 +156,8 @@ export const tools = [
         nome: str("Novo nome"),
         topico: str("Novo tópico"),
         categoria_id: str("Nova categoria-pai"),
-        posicao: num("Nova posição"),
-        slowmode_segundos: num("Slowmode em segundos (0 desliga)"),
+        posicao: int("Nova posição", { minimum: 0 }),
+        slowmode_segundos: int("Slowmode em segundos (0 desliga, máx. 21600)", { minimum: 0, maximum: 21600 }),
         nsfw: bool("Marcar como NSFW"),
       },
       ["canal_id"],
@@ -161,8 +188,12 @@ export const tools = [
       },
       ["canal_id", "alvo_id"],
     ),
+    needsConfirm: async (_ctx, { permitir }) => dangerousIn(permitir).length > 0,
+    describe: async ({ guild }, { canal_id, alvo_id, permitir }) =>
+      `Dar ${dangerousIn(permitir).join(", ")} a ${guild.roles.cache.has(alvo_id) ? `<@&${alvo_id}>` : `<@${alvo_id}>`} em **#${(await getChannel(guild, canal_id)).name}**`,
     run: async ({ guild }, { canal_id, alvo_id, permitir = [], negar = [] }) => {
       const ch = protect(await getChannel(guild, canal_id));
+      checkPerms([...permitir, ...negar]);
       const overwrite = {};
       for (const p of permitir) overwrite[p] = true;
       for (const p of negar) overwrite[p] = false;
@@ -215,6 +246,8 @@ export const tools = [
       },
       ["nome"],
     ),
+    needsConfirm: async (_ctx, { permissoes }) => dangerousIn(permissoes).length > 0,
+    describe: async (_ctx, { nome, permissoes }) => `Criar o cargo **@${nome}** com ${dangerousIn(permissoes).join(", ")}`,
     run: async ({ guild }, i) => {
       const r = await guild.roles.create({
         name: i.nome,
@@ -235,10 +268,13 @@ export const tools = [
         nome: str("Novo nome"),
         cor: str("Nova cor hex"),
         permissoes: { type: "array", items: { type: "string" }, description: "Substitui todas as permissões" },
-        posicao: num("Nova posição"),
+        posicao: int("Nova posição", { minimum: 0 }),
       },
       ["cargo_id"],
     ),
+    needsConfirm: async (_ctx, { permissoes }) => dangerousIn(permissoes).length > 0,
+    describe: async ({ guild }, { cargo_id, permissoes }) =>
+      `Dar ${dangerousIn(permissoes).join(", ")} ao cargo **@${(await getRole(guild, cargo_id)).name}**`,
     run: async ({ guild }, i) => {
       const r = await getRole(guild, i.cargo_id);
       await r.edit({
@@ -265,6 +301,12 @@ export const tools = [
     name: "dar_cargo",
     description: "Adiciona um cargo a um membro.",
     input_schema: obj({ membro_id: str("ID do membro"), cargo_id: str("ID do cargo") }, ["membro_id", "cargo_id"]),
+    needsConfirm: async ({ guild }, { cargo_id }) => {
+      const perms = (await getRole(guild, cargo_id)).permissions;
+      return DANGEROUS_PERMS.some((p) => perms.has(PermissionsBitField.Flags[p]));
+    },
+    describe: async ({ guild }, { membro_id, cargo_id }) =>
+      `Dar o cargo **@${(await getRole(guild, cargo_id)).name}** (tem permissões de moderação/administração) a **${(await getMember(guild, membro_id)).user.tag}**`,
     run: async ({ guild }, { membro_id, cargo_id }) => {
       await (await getMember(guild, membro_id)).roles.add(cargo_id);
       return "Cargo adicionado.";
@@ -285,7 +327,7 @@ export const tools = [
     name: "procurar_membros",
     readOnly: true,
     description: "Procura membros pelo nome (ou lista os primeiros, se não indicar nome).",
-    input_schema: obj({ nome: str("Parte do nome/apelido"), limite: num("Máximo de resultados (padrão 25)") }),
+    input_schema: obj({ nome: str("Parte do nome/apelido"), limite: int("Máximo de resultados (1-100, padrão 25)", { minimum: 1, maximum: 100 }) }),
     run: async ({ guild }, { nome, limite = 25 }) => {
       const members = nome
         ? await guild.members.search({ query: nome, limit: limite })
@@ -312,7 +354,7 @@ export const tools = [
     name: "castigar_membro",
     description: "Aplica timeout (castigo) a um membro. 0 minutos remove o castigo.",
     input_schema: obj(
-      { membro_id: str("ID do membro"), minutos: num("Duração em minutos (máx. 40320)"), motivo: str("Motivo") },
+      { membro_id: str("ID do membro"), minutos: int("Duração em minutos (0 remove, máx. 40320)", { minimum: 0, maximum: 40320 }), motivo: str("Motivo") },
       ["membro_id", "minutos"],
     ),
     run: async ({ guild }, { membro_id, minutos, motivo }) => {
@@ -337,14 +379,14 @@ export const tools = [
     description: "Bane um utilizador do servidor.",
     destructive: true,
     input_schema: obj(
-      { usuario_id: str("ID do utilizador"), motivo: str("Motivo"), apagar_mensagens_dias: num("Apagar mensagens dos últimos N dias (0-7)") },
+      { usuario_id: str("ID do utilizador"), motivo: str("Motivo"), apagar_mensagens_dias: int("Apagar mensagens dos últimos N dias (0-7)", { minimum: 0, maximum: 7 }) },
       ["usuario_id"],
     ),
     describe: async (_ctx, { usuario_id }) => `Banir o utilizador **<@${usuario_id}>**`,
     run: async ({ guild }, { usuario_id, motivo, apagar_mensagens_dias = 0 }) => {
       await guild.bans.create(usuario_id, {
         reason: motivo,
-        deleteMessageSeconds: Math.min(7, apagar_mensagens_dias) * 86400,
+        deleteMessageSeconds: apagar_mensagens_dias * 86400,
       });
       return "Utilizador banido.";
     },
@@ -384,10 +426,10 @@ export const tools = [
     name: "ler_mensagens",
     readOnly: true,
     description: "Lê as últimas mensagens de um canal.",
-    input_schema: obj({ canal_id: str("ID do canal"), quantidade: num("Quantas (máx. 100, padrão 20)") }, ["canal_id"]),
+    input_schema: obj({ canal_id: str("ID do canal"), quantidade: int("Quantas (1-100, padrão 20)", { minimum: 1, maximum: 100 }) }, ["canal_id"]),
     run: async ({ guild }, { canal_id, quantidade = 20 }) => {
       const ch = await getChannel(guild, canal_id);
-      const msgs = await ch.messages.fetch({ limit: Math.min(100, quantidade) });
+      const msgs = await ch.messages.fetch({ limit: quantidade });
       return msgs.reverse().map((m) => ({
         id: m.id,
         autor: m.author.tag,
@@ -414,12 +456,12 @@ export const tools = [
     name: "limpar_mensagens",
     description: "Apaga as últimas N mensagens de um canal (máx. 100, só mensagens com menos de 14 dias).",
     destructive: true,
-    input_schema: obj({ canal_id: str("ID do canal"), quantidade: num("Quantas apagar") }, ["canal_id", "quantidade"]),
+    input_schema: obj({ canal_id: str("ID do canal"), quantidade: int("Quantas apagar (1-100)", { minimum: 1, maximum: 100 }) }, ["canal_id", "quantidade"]),
     describe: async ({ guild }, { canal_id, quantidade }) =>
-      `Apagar ${quantidade} mensagens em **#${(await getChannel(guild, canal_id)).name}**`,
+      `Apagar ${quantidade} mensagens em **#${protect(await getChannel(guild, canal_id)).name}**`,
     run: async ({ guild }, { canal_id, quantidade }) => {
-      const ch = await getChannel(guild, canal_id);
-      const deleted = await ch.bulkDelete(Math.min(100, quantidade), true);
+      const ch = protect(await getChannel(guild, canal_id));
+      const deleted = await ch.bulkDelete(quantidade, true);
       return `${deleted.size} mensagens apagadas.`;
     },
   },
@@ -444,7 +486,7 @@ export const tools = [
     name: "criar_convite",
     description: "Cria um link de convite para um canal.",
     input_schema: obj(
-      { canal_id: str("ID do canal"), horas: num("Validade em horas (0 = nunca expira)"), usos: num("Máximo de usos (0 = ilimitado)") },
+      { canal_id: str("ID do canal"), horas: int("Validade em horas (0 = nunca expira, máx. 168)", { minimum: 0, maximum: 168 }), usos: int("Máximo de usos (0 = ilimitado, máx. 100)", { minimum: 0, maximum: 100 }) },
       ["canal_id"],
     ),
     run: async ({ guild }, { canal_id, horas = 24, usos = 0 }) => {
@@ -459,7 +501,7 @@ export const toolMap = new Map(tools.map((t) => [t.name, t]));
 // Definições enviadas à API (sem as funções locais).
 export const apiTools = tools.map(({ name, description, input_schema }) => ({ name, description, input_schema }));
 
-// Validação simples do input (campos obrigatórios e tipos básicos).
+// Validação simples do input (campos obrigatórios, tipos básicos e limites numéricos).
 export function validateInput(tool, input) {
   if (typeof input !== "object" || input === null) return "input inválido";
   const { properties, required = [] } = tool.input_schema;
@@ -467,8 +509,19 @@ export function validateInput(tool, input) {
   for (const [key, value] of Object.entries(input)) {
     const spec = properties[key];
     if (!spec) return `campo desconhecido "${key}"`;
-    const ok = spec.type === "array" ? Array.isArray(value) : typeof value === spec.type;
-    if (!ok) return `campo "${key}" deve ser ${spec.type}`;
+    if (spec.type === "number" || spec.type === "integer") {
+      if (typeof value !== "number" || !Number.isFinite(value)) return `campo "${key}" deve ser um número`;
+      if (spec.type === "integer" && !Number.isInteger(value)) return `campo "${key}" deve ser um número inteiro`;
+      if (spec.minimum !== undefined && value < spec.minimum) return `campo "${key}" deve ser no mínimo ${spec.minimum}`;
+      if (spec.maximum !== undefined && value > spec.maximum) return `campo "${key}" deve ser no máximo ${spec.maximum}`;
+      continue;
+    }
+    if (spec.type === "array") {
+      if (!Array.isArray(value)) return `campo "${key}" deve ser uma lista`;
+      if (spec.items?.type && value.some((v) => typeof v !== spec.items.type)) return `campo "${key}" deve ser uma lista de ${spec.items.type}`;
+      continue;
+    }
+    if (typeof value !== spec.type) return `campo "${key}" deve ser ${spec.type}`;
     if (spec.enum && !spec.enum.includes(value)) return `campo "${key}" deve ser um de: ${spec.enum.join(", ")}`;
   }
   return null;
